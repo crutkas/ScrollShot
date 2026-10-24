@@ -18,7 +18,8 @@ jobs:
         with:
           dotnet-version: "10.0.x"
 
-      - uses: microsoft/setup-winapp@v1
+      - name: Install winapp CLI
+        run: npm install -g @microsoft/winappcli
 
       # Optional signing: add repository secrets SIGNING_PFX_BASE64 (base64 of a .pfx whose subject
       # matches the manifest Publisher) and SIGNING_PFX_PASSWORD. Without them the bundle is unsigned.
