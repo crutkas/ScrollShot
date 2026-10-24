@@ -1,179 +1,134 @@
-using System.Drawing;
-using System.Drawing.Drawing2D;
-using System.Drawing.Imaging;
-using System.IO;
-using System.Runtime.InteropServices;
 using Microsoft.Win32;
+using Windows.Win32;
+using Windows.Win32.Graphics.Gdi;
+using Windows.Win32.UI.WindowsAndMessaging;
 
 namespace ScrollShot;
 
 static partial class Program
 {
-    // Tray glyph: viewfinder corners around a "scroll down" double chevron, drawn as vectors
-    // at the exact tray size so it stays crisp at any display scaling.
-    static class Glyph
+    // Tray glyph: viewfinder corners around a "scroll down" double chevron. Rendered with a tiny
+    // signed-distance rasterizer (4x4 supersampling) at the exact tray size, so it stays crisp.
+    internal static unsafe class Glyph
     {
         public static bool LightTaskbar =>
             Registry.GetValue(@"HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize", "SystemUsesLightTheme", 0) is int v && v == 1;
 
-        public static Color Accent
+        static uint Accent
         {
             get
             {
                 // AccentColor is stored as ABGR.
                 if (Registry.GetValue(@"HKEY_CURRENT_USER\Software\Microsoft\Windows\DWM", "AccentColor", null) is int abgr)
-                    return Color.FromArgb(255, abgr & 0xFF, (abgr >> 8) & 0xFF, (abgr >> 16) & 0xFF);
-                return Color.FromArgb(0, 120, 212);
+                    return Rgb((uint)abgr & 0xFF, ((uint)abgr >> 8) & 0xFF, ((uint)abgr >> 16) & 0xFF);
+                return Rgb(0, 120, 212);
             }
         }
 
-        public static Icon MakeIcon(bool busy)
+        static uint Rgb(uint r, uint g, uint b) => (r << 16) | (g << 8) | b;
+        static uint Blend(uint a, uint b, float t)
         {
-            int size = GetSystemMetrics(49 /*SM_CXSMICON*/);
-            if (size <= 0) size = 16;
-            bool light = LightTaskbar;
-            var fg = light ? Color.FromArgb(28, 28, 28) : Color.White;
-            using var bmp = new Bitmap(size, size, PixelFormat.Format32bppArgb);
-            using (var g = Graphics.FromImage(bmp)) Draw(g, size, fg, busy ? AccentFor(light) : fg);
-            var h = bmp.GetHicon();
-            var icon = (Icon)Icon.FromHandle(h).Clone();
-            DestroyIcon(h);
-            return icon;
+            uint C(int sh) => (uint)(((a >> sh) & 0xFF) + ((((b >> sh) & 0xFF) - (float)((a >> sh) & 0xFF)) * t)) & 0xFF;
+            return (C(16) << 16) | (C(8) << 8) | C(0);
         }
 
         // Accent tuned for contrast against the taskbar.
-        static Color AccentFor(bool lightTaskbar)
+        static uint AccentFor(bool lightTaskbar)
         {
-            var a = Accent;
-            float l = (0.299f * a.R + 0.587f * a.G + 0.114f * a.B) / 255f;
-            if (!lightTaskbar && l < 0.45f) return Blend(a, Color.White, 0.35f);
-            if (lightTaskbar && l > 0.6f) return Blend(a, Color.Black, 0.3f);
+            uint a = Accent;
+            float l = (0.299f * ((a >> 16) & 0xFF) + 0.587f * ((a >> 8) & 0xFF) + 0.114f * (a & 0xFF)) / 255f;
+            if (!lightTaskbar && l < 0.45f) return Blend(a, 0xFFFFFF, 0.35f);
+            if (lightTaskbar && l > 0.6f) return Blend(a, 0, 0.3f);
             return a;
         }
 
-        static Color Blend(Color a, Color b, float t) =>
-            Color.FromArgb(255, (int)(a.R + (b.R - a.R) * t), (int)(a.G + (b.G - a.G) * t), (int)(a.B + (b.B - a.B) * t));
-
-        public static void Draw(Graphics g, float size, Color frame, Color chevrons)
+        public static HICON MakeIcon(bool busy)
         {
-            g.SmoothingMode = SmoothingMode.AntiAlias;
-            g.PixelOffsetMode = PixelOffsetMode.HighQuality;
-            var saved = g.Save();
+            int size = PInvoke.GetSystemMetrics(SYSTEM_METRICS_INDEX.SM_CXSMICON);
+            if (size <= 0) size = 16;
+            bool light = LightTaskbar;
+            uint fg = light ? Rgb(28, 28, 28) : 0xFFFFFF;
+            var px = Render(size, fg, busy ? AccentFor(light) : fg);
+
+            var bi = new BITMAPINFO();
+            bi.bmiHeader.biSize = (uint)sizeof(BITMAPINFOHEADER);
+            bi.bmiHeader.biWidth = size;
+            bi.bmiHeader.biHeight = -size;
+            bi.bmiHeader.biPlanes = 1;
+            bi.bmiHeader.biBitCount = 32;
+            void* bits;
+            var color = PInvoke.CreateDIBSection(HDC.Null, &bi, DIB_USAGE.DIB_RGB_COLORS, &bits, default, 0);
+            px.AsSpan().CopyTo(new Span<uint>(bits, size * size));
+            var mask = PInvoke.CreateBitmap(size, size, 1, 1, null);
+            var info = new ICONINFO { fIcon = true, hbmColor = color, hbmMask = mask };
+            var icon = PInvoke.CreateIconIndirect(&info);
+            PInvoke.DeleteObject((HGDIOBJ)color.Value);
+            PInvoke.DeleteObject((HGDIOBJ)mask.Value);
+            return icon;
+        }
+
+        // Returns straight-alpha BGRA pixels.
+        static uint[] Render(int size, uint frame, uint chevrons)
+        {
             float s = size / 16f;
-            g.ScaleTransform(s, s);
-
-            // At 16px, 1px strokes on half-pixel coordinates keep the frame crisp.
             bool tiny = size <= 16;
-            float w = tiny ? 1f : 1.3f;
-            using var pen = new Pen(frame, w) { StartCap = LineCap.Round, EndCap = LineCap.Round, LineJoin = LineJoin.Round };
+            float w = (tiny ? 1f : 1.3f) * s / 2; // half stroke width, in pixels
+            float a = (tiny ? 1.5f : 1.75f) * s, b = (tiny ? 14.5f : 14.25f) * s, len = 3.75f * s, r = 1.6f * s;
 
-            // Viewfinder corners with softly rounded bends.
-            float a = tiny ? 1.5f : 1.75f, b = tiny ? 14.5f : 14.25f;
-            const float len = 3.75f, r = 1.6f;
-            Corner(g, pen, a, a, 1, 1, len, r);
-            Corner(g, pen, b, a, -1, 1, len, r);
-            Corner(g, pen, a, b, 1, -1, len, r);
-            Corner(g, pen, b, b, -1, -1, len, r);
-
-            using var cp = new Pen(chevrons, w) { StartCap = LineCap.Round, EndCap = LineCap.Round, LineJoin = LineJoin.Round };
-            g.DrawLines(cp, [new PointF(5.25f, 4.9f), new PointF(8f, 7.65f), new PointF(10.75f, 4.9f)]);
-            g.DrawLines(cp, [new PointF(5.25f, 8.35f), new PointF(8f, 11.1f), new PointF(10.75f, 8.35f)]);
-            g.Restore(saved);
-        }
-
-        static void Corner(Graphics g, Pen pen, float x, float y, int dx, int dy, float len, float r)
-        {
-            using var p = new GraphicsPath();
-            p.AddLine(x, y + dy * len, x, y + dy * r);
-            float cx = x + dx * r, cy = y + dy * r;
-            p.AddArc(cx - r, cy - r, 2 * r, 2 * r, dx > 0 ? 180 : 0, dx * dy * 90);
-            p.AddLine(x + dx * r, y, x + dx * len, y);
-            g.DrawPath(pen, p);
-        }
-
-        // App icon (exe, notifications): white glyph on a rounded accent tile, as a multi-size .ico.
-        public static void WriteIco(string path)
-        {
-            int[] sizes = [16, 20, 24, 32, 48, 64, 256];
-            var pngs = new List<byte[]>();
-            foreach (int sz in sizes)
+            var frameShapes = new List<Func<float, float, float>>();
+            foreach (var (x, y, dx, dy) in new[] { (a, a, 1, 1), (b, a, -1, 1), (a, b, 1, -1), (b, b, -1, -1) })
             {
-                using var bmp = new Bitmap(sz, sz, PixelFormat.Format32bppArgb);
-                using (var g = Graphics.FromImage(bmp))
+                float cx = x + dx * r, cy = y + dy * r;
+                frameShapes.Add((px, py) => Seg(px, py, x, y + dy * len, x, cy));
+                frameShapes.Add((px, py) => Arc(px, py, cx, cy, r, -dx, -dy));
+                frameShapes.Add((px, py) => Seg(px, py, cx, y, x + dx * len, y));
+            }
+            var chevShapes = new List<Func<float, float, float>>();
+            foreach (float top in new[] { 4.9f, 8.35f })
+            {
+                float y0 = top * s, y1 = (top + 2.75f) * s, x0 = 5.25f * s, xm = 8f * s, x1 = 10.75f * s;
+                chevShapes.Add((px, py) => Seg(px, py, x0, y0, xm, y1));
+                chevShapes.Add((px, py) => Seg(px, py, xm, y1, x1, y0));
+            }
+
+            var outPx = new uint[size * size];
+            const int ss = 4;
+            for (int y = 0; y < size; y++)
+                for (int x = 0; x < size; x++)
                 {
-                    g.SmoothingMode = SmoothingMode.AntiAlias;
-                    g.Clear(Color.Transparent);
-                    float rr = sz * 0.22f;
-                    using var tile = new GraphicsPath();
-                    tile.AddArc(0, 0, 2 * rr, 2 * rr, 180, 90);
-                    tile.AddArc(sz - 2 * rr, 0, 2 * rr, 2 * rr, 270, 90);
-                    tile.AddArc(sz - 2 * rr, sz - 2 * rr, 2 * rr, 2 * rr, 0, 90);
-                    tile.AddArc(0, sz - 2 * rr, 2 * rr, 2 * rr, 90, 90);
-                    tile.CloseFigure();
-                    using (var br = new LinearGradientBrush(new Rectangle(0, 0, sz, sz), Color.FromArgb(0, 120, 212), Color.FromArgb(0, 90, 170), 90f))
-                        g.FillPath(br, tile);
-                    // Glyph inset inside the tile, drawn directly (no resampling) so it stays sharp.
-                    float inset = sz * 0.18f, gs = sz - 2 * inset;
-                    g.TranslateTransform(inset, inset);
-                    Draw(g, gs, Color.White, Color.White);
+                    int hf = 0, hc = 0;
+                    for (int sy = 0; sy < ss; sy++)
+                        for (int sx = 0; sx < ss; sx++)
+                        {
+                            float px = x + (sx + 0.5f) / ss, py = y + (sy + 0.5f) / ss;
+                            if (frameShapes.Any(f => f(px, py) <= w)) hf++;
+                            else if (chevShapes.Any(f => f(px, py) <= w)) hc++;
+                        }
+                    int cov = hf + hc;
+                    if (cov == 0) continue;
+                    uint col = hf >= hc ? frame : chevrons;
+                    uint alpha = (uint)(cov * 255 / (ss * ss));
+                    outPx[y * size + x] = (alpha << 24) | col;
                 }
-                using var ms = new MemoryStream();
-                bmp.Save(ms, ImageFormat.Png);
-                pngs.Add(ms.ToArray());
-            }
-            using var fs = File.Create(path);
-            using var w = new BinaryWriter(fs);
-            w.Write((short)0); w.Write((short)1); w.Write((short)sizes.Length);
-            int offset = 6 + 16 * sizes.Length;
-            for (int i = 0; i < sizes.Length; i++)
-            {
-                w.Write((byte)(sizes[i] >= 256 ? 0 : sizes[i])); w.Write((byte)(sizes[i] >= 256 ? 0 : sizes[i]));
-                w.Write((byte)0); w.Write((byte)0); w.Write((short)1); w.Write((short)32);
-                w.Write(pngs[i].Length); w.Write(offset);
-                offset += pngs[i].Length;
-            }
-            foreach (var p in pngs) w.Write(p);
+            return outPx;
         }
 
-        // Debug aid: renders the glyph at tray sizes on light/dark backgrounds (and magnified).
-        public static void Preview(string path)
+        static float Seg(float px, float py, float ax, float ay, float bx, float by)
         {
-            int[] sizes = [16, 20, 24, 32];
-            const int zoom = 8, pad = 16;
-            int cell = 32 * zoom + pad;
-            using var sheet = new Bitmap(pad + sizes.Length * cell, pad + 4 * (cell + 40), PixelFormat.Format32bppArgb);
-            using var g = Graphics.FromImage(sheet);
-            g.Clear(Color.FromArgb(128, 128, 128));
-            var rows = new (Color bg, Color fg, Color ch, string label)[]
-            {
-                (Color.FromArgb(32, 32, 32), Color.White, Color.White, "dark taskbar"),
-                (Color.FromArgb(32, 32, 32), Color.White, AccentFor(false), "dark, capturing"),
-                (Color.FromArgb(243, 243, 243), Color.FromArgb(28, 28, 28), Color.FromArgb(28, 28, 28), "light taskbar"),
-                (Color.FromArgb(243, 243, 243), Color.FromArgb(28, 28, 28), AccentFor(true), "light, capturing"),
-            };
-            using var font = new Font("Segoe UI", 14);
-            for (int row = 0; row < rows.Length; row++)
-            {
-                int y0 = pad + row * (cell + 40);
-                g.DrawString(rows[row].label, font, Brushes.White, pad, y0);
-                for (int i = 0; i < sizes.Length; i++)
-                {
-                    int sz = sizes[i];
-                    using var ic = new Bitmap(sz, sz, PixelFormat.Format32bppArgb);
-                    using (var ig = Graphics.FromImage(ic)) Draw(ig, sz, rows[row].fg, rows[row].ch);
-                    int x0 = pad + i * cell;
-                    using (var bg = new SolidBrush(rows[row].bg)) g.FillRectangle(bg, x0, y0 + 30, sz * zoom, sz * zoom);
-                    g.InterpolationMode = InterpolationMode.NearestNeighbor;
-                    g.PixelOffsetMode = PixelOffsetMode.Half;
-                    g.DrawImage(ic, x0, y0 + 30, sz * zoom, sz * zoom);
-                    g.PixelOffsetMode = PixelOffsetMode.Default;
-                    g.DrawString($"{sz}px", font, Brushes.White, x0 + sz * zoom + 4, y0 + 30);
-                }
-            }
-            sheet.Save(path, ImageFormat.Png);
+            float vx = bx - ax, vy = by - ay, wx = px - ax, wy = py - ay;
+            float t = Math.Clamp((wx * vx + wy * vy) / Math.Max(1e-6f, vx * vx + vy * vy), 0, 1);
+            float dx = wx - t * vx, dy = wy - t * vy;
+            return MathF.Sqrt(dx * dx + dy * dy);
         }
 
-        [DllImport("user32.dll")] static extern int GetSystemMetrics(int i);
-        [DllImport("user32.dll")] static extern bool DestroyIcon(IntPtr h);
+        // Quarter arc around (cx, cy) in the quadrant pointing toward (qx, qy).
+        static float Arc(float px, float py, float cx, float cy, float r, int qx, int qy)
+        {
+            float dx = px - cx, dy = py - cy;
+            if (dx * qx >= 0 && dy * qy >= 0) return MathF.Abs(MathF.Sqrt(dx * dx + dy * dy) - r);
+            return MathF.Min(Dist(px, py, cx + qx * r, cy), Dist(px, py, cx, cy + qy * r));
+        }
+
+        static float Dist(float ax, float ay, float bx, float by) => MathF.Sqrt((ax - bx) * (ax - bx) + (ay - by) * (ay - by));
     }
 }

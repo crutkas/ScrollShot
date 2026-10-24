@@ -1,0 +1,58 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+
+      - uses: microsoft/setup-winapp@v1
+
+      # Optional signing: add repository secrets SIGNING_PFX_BASE64 (base64 of a .pfx whose subject
+      # matches the manifest Publisher) and SIGNING_PFX_PASSWORD. Without them the bundle is unsigned.
+      - name: Prepare signing certificate
+        env:
+          PFX: ${{ secrets.SIGNING_PFX_BASE64 }}
+          PFX_PASSWORD: ${{ secrets.SIGNING_PFX_PASSWORD }}
+        run: |
+          if ($env:PFX) {
+            $pfx = Join-Path $env:RUNNER_TEMP "sign.pfx"
+            [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:PFX))
+            New-Item -ItemType Directory dist-extra -Force | Out-Null
+            $cert = [Security.Cryptography.X509Certificates.X509Certificate2]::new($pfx, $env:PFX_PASSWORD)
+            [IO.File]::WriteAllBytes("dist-extra/ScrollShot.cer", $cert.Export("Cert"))
+          }
+
+      - name: Build (Native AOT x64 + arm64, msixbundle)
+        env:
+          PFX_PASSWORD: ${{ secrets.SIGNING_PFX_PASSWORD }}
+        run: |
+          $version = if ($env:GITHUB_REF_TYPE -eq "tag") { $env:GITHUB_REF_NAME.TrimStart("v") } else { "0.0.${{ github.run_number }}" }
+          $params = @{ Version = $version }
+          $pfx = Join-Path $env:RUNNER_TEMP "sign.pfx"
+          if (Test-Path $pfx) { $params.Cert = $pfx; $params.CertPassword = $env:PFX_PASSWORD }
+          ./build.ps1 @params
+          if (Test-Path dist-extra) { Copy-Item dist-extra/* dist/ }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ScrollShot
+          path: dist/*
+
+      - name: Publish GitHub release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create $env:GITHUB_REF_NAME (Get-ChildItem dist).FullName --title $env:GITHUB_REF_NAME --generate-notes

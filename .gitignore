@@ -2,3 +2,13 @@ bin/
 obj/
 *.user
 .vs/
+gen/
+old/
+*.pfx
+publish/
+dist/
+logo.png
+
+# Development certificate
+devcert.pfx
+*.cer

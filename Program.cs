@@ -1,17 +1,19 @@
 using System.Diagnostics;
 using System.Drawing;
-using System.Drawing.Imaging;
-using System.IO;
-using System.Runtime.InteropServices;
-using System.Windows.Automation;
+using Windows.Win32;
+using Windows.Win32.Foundation;
+using Windows.Win32.Graphics.Dwm;
+using Windows.Win32.Graphics.Gdi;
+using Windows.Win32.Storage.Xps;
+using Windows.Win32.UI.WindowsAndMessaging;
 
 namespace ScrollShot;
 
-// Full-page (scrolling) capture for any window: hover over the scrollable area,
-// it scrolls to the top, then wheels down capturing frames and stitches the overlaps.
+// Full-page (scrolling) capture for any window. Scrolls the pane with posted wheel messages,
+// captures frames with PrintWindow and stitches the overlaps. Never moves the mouse or takes focus.
 static partial class Program
 {
-    sealed class Frame
+    internal sealed class Frame
     {
         public int W, H, OX, OY;
         public int[] Px = [];
@@ -25,7 +27,7 @@ static partial class Program
         public int MaxFrames = 300;
         public int MaxHeight = 40000;
         public bool Open = true, Copy = true;
-        public bool Screen, Uia, ForceOpen;
+        public bool Uia, ForceOpen;
         public string? Out, Window;
         public int? X, Y;
         public string Hotkey = "Ctrl+Alt+S";
@@ -34,60 +36,51 @@ static partial class Program
     [STAThread]
     static int Main(string[] args)
     {
-        SetProcessDpiAwarenessContext(new IntPtr(-4));
         bool tray = args.Length == 0 || args.Any(a => a.Equals("--tray", StringComparison.OrdinalIgnoreCase));
-        if (args.Length == 2 && args[0] == "--icon-preview") { Glyph.Preview(args[1]); return 0; }
-        if (args.Length == 2 && args[0] == "--write-ico") { Glyph.WriteIco(args[1]); return 0; }
-        if (!tray) AttachConsole(-1);
+        if (!tray) PInvoke.AttachConsole(unchecked((uint)-1) /*ATTACH_PARENT_PROCESS*/);
         Options? o;
         try { o = Parse(args); } catch (Exception ex) { Console.Error.WriteLine(ex.Message); return 1; }
         if (o == null) return 1;
-        if (tray) return TrayApp.Run(o);
+        if (tray) return Tray.Run(o);
 
         // The real mouse is never moved: the point is only used to pick the window/pane.
-        IntPtr hwnd;
-        POINT pt;
+        nint hwnd;
+        Point pt;
         if (o.Window != null)
         {
-            hwnd = FindTopWindow(o.Window);
-            if (hwnd == IntPtr.Zero) { Console.Error.WriteLine($"No visible window with title containing \"{o.Window}\"."); return 1; }
-            GetWindowRect(hwnd, out var r);
-            pt = new POINT { X = (r.Left + r.Right) / 2, Y = (r.Top + r.Bottom) / 2 };
+            hwnd = Win.FindTopWindow(o.Window);
+            if (hwnd == 0) { Console.Error.WriteLine($"No visible window with title containing \"{o.Window}\"."); return 1; }
+            var r = Win.WindowRect(hwnd);
+            pt = new Point((r.left + r.right) / 2, (r.top + r.bottom) / 2);
         }
         else
         {
-            if (o.X is int px && o.Y is int py) pt = new POINT { X = px, Y = py };
+            if (o.X is int px && o.Y is int py) pt = new Point(px, py);
             else
             {
                 Console.WriteLine("Hover the mouse over the area you want to scroll-capture.");
                 for (int i = o.Delay; i > 0; i--) { Console.Write($"{i}.. "); Thread.Sleep(1000); }
                 Console.WriteLine();
-                GetCursorPos(out pt);
+                PInvoke.GetCursorPos(out pt);
             }
-            hwnd = GetAncestor(WindowFromPoint(pt), 2 /*GA_ROOT*/);
-            if (hwnd == IntPtr.Zero) { Console.Error.WriteLine("No window at that point."); return 1; }
+            hwnd = Win.RootAt(pt);
+            if (hwnd == 0) { Console.Error.WriteLine("No window at that point."); return 1; }
         }
+        Uia.Init();
         return CaptureToFile(o, hwnd, pt, o.Window == null) != null ? 0 : 1;
     }
 
     // Scrolls the pane at pt (or the window's main pane), stitches, saves, copies, opens. Returns the file path.
-    internal static string? CaptureToFile(Options o, IntPtr hwnd, POINT pt, bool usePoint)
+    internal static string? CaptureToFile(Options o, nint hwnd, Point pt, bool usePoint)
     {
-        Console.WriteLine($"Target: \"{Title(hwnd)}\"");
-        if (o.Screen) { ShowWindow(GetConsoleWindow(), 6 /*SW_MINIMIZE*/); SetForegroundWindow(hwnd); Thread.Sleep(300); }
+        Console.WriteLine($"Target: \"{Win.Title(hwnd)}\"");
 
-        var pane = Pane.Find(hwnd, usePoint ? pt : null);
+        var pane = Uia.FindPane(hwnd, usePoint ? pt : null);
         if (pane != null) pt = pane.Point;
-        IScroller scroller;
-        if (pane != null && o.Uia) scroller = new UiaScroller(pane);
-        else
-        {
-            scroller = new WheelScroller(hwnd, pt, pane);
-
-        }
+        IScroller scroller = pane != null && o.Uia ? new UiaScroller(pane) : new WheelScroller(hwnd, pt, pane);
         Console.WriteLine($"Scrolling via {scroller.Name}");
 
-        Frame Grab() => Capture(hwnd, o.Screen);
+        Frame Grab() => Capture(hwnd);
 
         var sw = Stopwatch.StartNew();
         var prev = WaitStable(Grab);
@@ -117,10 +110,12 @@ static partial class Program
         Frame last = prev;
 
         Console.WriteLine($"Capturing... (Esc to stop)  [to top: {sw.Elapsed.TotalSeconds:F1}s]");
-        GetAsyncKeyState(0x1B);
+        PInvoke.GetAsyncKeyState(0x1B);
+        double pxPerPct = 0; // content pixels per scroll percent: constant for a document, learned from the first good match
         for (int n = 0; n < o.MaxFrames && totalHeight < o.MaxHeight; n++)
         {
-            if ((GetAsyncKeyState(0x1B) & 0x8001) != 0) { Console.WriteLine("\nStopped (Esc)."); break; }
+            if ((PInvoke.GetAsyncKeyState(0x1B) & 0x8001) != 0) { Console.WriteLine("Stopped (Esc)."); break; }
+            double p0 = scroller.Position;
             if (!scroller.Down(amount)) break; // already at the end
             var cur = WaitStable(Grab);
             if (cur.W != W || cur.H != H) { Console.Error.WriteLine("Window size changed; stopping."); break; }
@@ -137,11 +132,34 @@ static partial class Program
             else if (Same(prev, cur)) break; // reached the end
 
             int h = bottom - top + 1;
-            // Match on a band around the cursor first: that's the pane being scrolled.
+            double Predict() { double p1 = scroller.Position; return pxPerPct > 0 && p0 >= 0 && p1 >= 0 ? (p1 - p0) * pxPerPct : -1; }
+            double predicted = Predict();
+            // Apps accelerate bursts of wheel messages; if a step overshot, back up so the frames still overlap.
+            for (int k = 0; k < 3 && predicted > 0.85 * h; k++)
+            {
+                scroller.Back(Math.Max(scroller.Clamp(0), amount * (predicted - 0.6 * h) / predicted));
+                cur = WaitStable(Grab);
+                predicted = Predict();
+            }
+
+            // Match on a band around the pane point first: that's the pane being scrolled.
             int cx = Math.Clamp(pt.X - cur.OX, left, right);
             int bandL = Math.Max(left, cx - 300), bandR = Math.Min(right, cx + 300);
-            int dy = FindShift(prev, cur, top, bottom, bandL, bandR, lastDy, out double score);
-            if (dy <= 0) dy = FindShift(prev, cur, top, bottom, left, right, lastDy, out score);
+            int dy; double score;
+            if (predicted >= 1)
+            {
+                // The scroll position tells us the shift; the pixels just refine it.
+                int e = (int)Math.Round(predicted);
+                dy = FindShift(prev, cur, top, bottom, bandL, bandR, e, out score, e - 12, e + 12);
+                if (dy <= 0) { dy = Math.Min(e, h); score = 0; }
+            }
+            else
+            {
+                dy = FindShift(prev, cur, top, bottom, bandL, bandR, lastDy, out score);
+                if (dy <= 0) dy = FindShift(prev, cur, top, bottom, left, right, lastDy, out score);
+                double moved = scroller.Position - p0;
+                if (dy > 0 && score >= 0.9 && p0 >= 0 && moved > 0.01) pxPerPct = dy / moved;
+            }
             if (dy > 0) VoteColumns(prev, cur, top, bottom, dy, scrollVotes, staticVotes);
             if (dy <= 0)
             {
@@ -152,13 +170,13 @@ static partial class Program
             else
             {
                 lastDy = dy;
-                amount = scroller.Clamp(amount * (0.7 * h) / dy);
+                amount = scroller.Clamp(amount * (0.6 * h) / dy);
             }
 
             for (int y = bottom - dy + 1; y <= bottom; y++) strips.Add(cur.Row(y).ToArray());
             totalHeight += dy;
             prev = last = cur;
-            Console.WriteLine($"  frame {n + 1}: dy={dy} score={score:F2} next={amount:F2} height={totalHeight}px");
+            Console.WriteLine($"  frame {n + 1}: dy={dy}{(predicted >= 1 ? $" (predicted {predicted:F0})" : "")} score={score:F2} next={amount:F2} height={totalHeight}px");
         }
         Console.WriteLine($"  [frames done: {sw.Elapsed.TotalSeconds:F1}s]");
         scroller.Restore();
@@ -166,16 +184,15 @@ static partial class Program
 
         var scrollCols = new bool[W];
         for (int x = 0; x < W; x++) scrollCols[x] = scrollVotes[x] >= staticVotes[x];
-        using var bmp = Compose(first, last, strips, top, bottom, scrollCols, regionKnown);
+        var img = Compose(first, last, strips, top, bottom, scrollCols, regionKnown);
         var outPath = o.Out ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyPictures), "ScrollShots", $"ScrollShot_{DateTime.Now:yyyyMMdd_HHmmss}.png");
         Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(outPath))!);
-        bmp.Save(outPath, ImageFormat.Png);
-        Console.WriteLine($"Saved {bmp.Width}x{bmp.Height} in {sw.Elapsed.TotalSeconds:F1}s -> {outPath}");
-        if (o.Copy) try { Clipboard.SetImage(bmp); Console.WriteLine("Copied to clipboard."); } catch { }
-        if (o.Open) Process.Start(new ProcessStartInfo(outPath) { UseShellExecute = true });
+        Output.SavePng(outPath, img);
+        Console.WriteLine($"Saved {img.W}x{img.H} in {sw.Elapsed.TotalSeconds:F1}s -> {outPath}");
+        if (o.Copy) try { Output.CopyToClipboard(img, outPath); Console.WriteLine("Copied to clipboard."); } catch (Exception ex) { Console.Error.WriteLine($"Clipboard: {ex.Message}"); }
+        if (o.Open) Output.Open(outPath);
         return outPath;
     }
-
     static Options? Parse(string[] args)
     {
         var o = new Options();
@@ -191,7 +208,6 @@ static partial class Program
                 case "--max-height": o.MaxHeight = int.Parse(Next()); break;
                 case "--no-open": o.Open = false; break;
                 case "--no-copy": o.Copy = false; break;
-                case "--screen": o.Screen = true; break;
                 case "--uia": o.Uia = true; break;
                 case "--window": o.Window = Next(); break;
                 case "--tray": break;
@@ -217,7 +233,6 @@ static partial class Program
                           --out FILE       output PNG (default Pictures\ScrollShots\...)
                           --max-frames N   default 300     --max-height N   default 40000
                           --uia            scroll with UI Automation calls (works more widely, but can bring the app to the front)
-                          --screen         capture from screen (brings window to front) instead of PrintWindow
                           --no-open        don't open the result
                           --no-copy        don't copy the result to the clipboard
                         """);
@@ -229,27 +244,48 @@ static partial class Program
 
     // ---------- capture ----------
 
-    static Frame Capture(IntPtr hwnd, bool fromScreen)
+    static unsafe Frame Capture(nint hwnd)
     {
-        GetWindowRect(hwnd, out var wr);
-        if (wr.Right - wr.Left <= 0 || wr.Bottom - wr.Top <= 0 || IsIconic(hwnd))
-            throw new InvalidOperationException("the window closed or was minimized");
-        if (DwmGetWindowAttribute(hwnd, 9 /*DWMWA_EXTENDED_FRAME_BOUNDS*/, out RECT fr, Marshal.SizeOf<RECT>()) != 0) fr = wr;
-        var crop = Rectangle.FromLTRB(fr.Left - wr.Left, fr.Top - wr.Top, fr.Right - wr.Left, fr.Bottom - wr.Top);
+        var h = (HWND)hwnd;
+        var wr = Win.WindowRect(hwnd);
+        int ww = wr.right - wr.left, wh = wr.bottom - wr.top;
+        if (ww <= 0 || wh <= 0 || PInvoke.IsIconic(h)) throw new InvalidOperationException("the window closed or was minimized");
+        RECT fr;
+        if (PInvoke.DwmGetWindowAttribute(h, DWMWINDOWATTRIBUTE.DWMWA_EXTENDED_FRAME_BOUNDS, &fr, (uint)sizeof(RECT)).Failed) fr = wr;
+        int cl = Math.Max(0, fr.left - wr.left), ct = Math.Max(0, fr.top - wr.top);
+        int cw = Math.Min(ww, fr.right - wr.left) - cl, ch = Math.Min(wh, fr.bottom - wr.top) - ct;
 
-        using var full = new Bitmap(wr.Right - wr.Left, wr.Bottom - wr.Top, PixelFormat.Format32bppArgb);
-        using (var g = Graphics.FromImage(full))
+        var screen = PInvoke.GetDC(HWND.Null);
+        var mem = PInvoke.CreateCompatibleDC(screen);
+        var bi = new BITMAPINFO();
+        bi.bmiHeader.biSize = (uint)sizeof(BITMAPINFOHEADER);
+        bi.bmiHeader.biWidth = ww;
+        bi.bmiHeader.biHeight = -wh; // top-down
+        bi.bmiHeader.biPlanes = 1;
+        bi.bmiHeader.biBitCount = 32;
+        void* bits;
+        var dib = PInvoke.CreateDIBSection(mem, &bi, DIB_USAGE.DIB_RGB_COLORS, &bits, HANDLE.Null, 0);
+        var old = PInvoke.SelectObject(mem, (HGDIOBJ)dib.Value);
+        try
         {
-            if (fromScreen) g.CopyFromScreen(wr.Left, wr.Top, 0, 0, full.Size);
-            else { var hdc = g.GetHdc(); PrintWindow(hwnd, hdc, 2 /*PW_RENDERFULLCONTENT*/); g.ReleaseHdc(hdc); }
+            PInvoke.PrintWindow(h, mem, (PRINT_WINDOW_FLAGS)2 /*PW_RENDERFULLCONTENT*/);
+            var f = new Frame { W = cw, H = ch, OX = wr.left + cl, OY = wr.top + ct, Px = new int[cw * ch] };
+            int* src = (int*)bits;
+            for (int y = 0; y < ch; y++)
+            {
+                var row = new ReadOnlySpan<int>(src + (y + ct) * ww + cl, cw);
+                row.CopyTo(f.Px.AsSpan(y * cw, cw));
+            }
+            for (int i = 0; i < f.Px.Length; i++) f.Px[i] |= unchecked((int)0xFF000000);
+            return f;
         }
-        crop.Intersect(new Rectangle(Point.Empty, full.Size));
-        var f = new Frame { W = crop.Width, H = crop.Height, OX = wr.Left + crop.Left, OY = wr.Top + crop.Top, Px = new int[crop.Width * crop.Height] };
-        var bd = full.LockBits(crop, ImageLockMode.ReadOnly, PixelFormat.Format32bppArgb);
-        for (int y = 0; y < f.H; y++) Marshal.Copy(bd.Scan0 + y * bd.Stride, f.Px, y * f.W, f.W);
-        full.UnlockBits(bd);
-        for (int i = 0; i < f.Px.Length; i++) f.Px[i] |= unchecked((int)0xFF000000);
-        return f;
+        finally
+        {
+            PInvoke.SelectObject(mem, old);
+            PInvoke.DeleteObject((HGDIOBJ)dib.Value);
+            PInvoke.DeleteDC(mem);
+            PInvoke.ReleaseDC(HWND.Null, screen);
+        }
     }
 
     static Frame WaitStable(Func<Frame> grab)
@@ -268,7 +304,6 @@ static partial class Program
     }
 
     // ---------- stitching ----------
-
     // Tolerates a few changed pixels (blinking caret, hover effects) and changes confined to a
     // narrow vertical strip (overlay scrollbars that fade in/out after each scroll).
     static bool Same(Frame a, Frame b)
@@ -339,7 +374,7 @@ static partial class Program
     }
 
     // Finds dy such that cur row (top+i) ~= prev row (top+i+dy) within the scrolling region.
-    static int FindShift(Frame prev, Frame cur, int top, int bottom, int left, int right, int? hint, out double score)
+    static int FindShift(Frame prev, Frame cur, int top, int bottom, int left, int right, int? hint, out double score, int minDy = 1, int maxDy = int.MaxValue)
     {
         int h = bottom - top + 1, bins = Math.Clamp((right - left + 1) / 4, 8, 64);
         var a = new float[h][]; var b = new float[h][]; var info = new bool[h];
@@ -355,7 +390,8 @@ static partial class Program
         var valid = new List<double>();
         for (int dy = 1; dy < h; dy++)
         {
-            if (h - dy < h / 5) break; // need real overlap; tiny overlaps match by accident
+            if (dy < minDy) continue;
+            if (dy > maxDy || h - dy < h / 5) break; // need real overlap; tiny overlaps match by accident
             double sum = 0; int cnt = 0;
             for (int i = 0; i + dy < h; i++)
             {
@@ -387,15 +423,17 @@ static partial class Program
         }
         return pick;
     }
-    static Bitmap Compose(Frame first, Frame last, List<int[]> strips, int top, int bottom, bool[] scrollCols, bool scrolled)
+
+    internal sealed class Image { public int W, H; public int[] Px = []; }
+
+    static Image Compose(Frame first, Frame last, List<int[]> strips, int top, int bottom, bool[] scrollCols, bool scrolled)
     {
         int W = first.W;
         if (!scrolled) { top = 0; bottom = first.H - 1; }
         int height = (bottom + 1) + strips.Count + (last.H - 1 - bottom);
-        var bmp = new Bitmap(W, height, PixelFormat.Format32bppArgb);
-        var bd = bmp.LockBits(new Rectangle(0, 0, W, height), ImageLockMode.WriteOnly, PixelFormat.Format32bppArgb);
+        var img = new Image { W = W, H = height, Px = new int[W * height] };
         int y = 0;
-        void Put(ReadOnlySpan<int> row) { Marshal.Copy(row.ToArray(), 0, bd.Scan0 + y * bd.Stride, W); y++; }
+        void Put(ReadOnlySpan<int> row) { row.CopyTo(img.Px.AsSpan(y * W, W)); y++; }
 
         for (int r = 0; r <= bottom; r++) Put(first.Row(r));
 
@@ -412,230 +450,6 @@ static partial class Program
             Put(tmp);
         }
         for (int r = bottom + 1; r < last.H; r++) Put(last.Row(r));
-        bmp.UnlockBits(bd);
-        return bmp;
+        return img;
     }
-
-    static string Title(IntPtr h) { var sb = new System.Text.StringBuilder(256); GetWindowText(h, sb, 256); return sb.ToString(); }
-
-    static IntPtr FindTopWindow(string titlePart)
-    {
-        IntPtr found = IntPtr.Zero;
-        EnumWindows((h, _) =>
-        {
-            if (IsWindowVisible(h) && !IsIconic(h) && Title(h).Contains(titlePart, StringComparison.OrdinalIgnoreCase)) { found = h; return false; }
-            return true;
-        }, IntPtr.Zero);
-        return found;
-    }
-
-    // ---------- scrolling (never touches the real mouse) ----------
-
-    interface IScroller
-    {
-        string Name { get; }
-        double InitialAmount { get; }
-        double Clamp(double amount);
-        bool ToTop();               // false when nothing more to do
-        bool Down(double amount);   // false when already at the end
-        void Restore() { }          // put the scroll position back where the user had it
-    }
-
-    // Finds the scrollable pane (read-only UI Automation: reading never activates the app).
-    sealed class Pane
-    {
-        public ScrollPattern Sp = null!;
-        public string Name = "";
-        public POINT Point; // inside the pane's visible part
-
-        public static Pane? Find(IntPtr hwnd, POINT? at)
-        {
-            try
-            {
-                AutomationElement? el = null;
-                if (at is POINT p)
-                {
-                    // Walk up from the element at the point to the nearest vertically scrollable pane.
-                    var e = AutomationElement.FromPoint(new System.Windows.Point(p.X, p.Y));
-                    var walker = TreeWalker.ControlViewWalker;
-                    while (e != null && !IsVScrollable(e)) e = walker.GetParent(e);
-                    el = e;
-                }
-                if (el == null)
-                {
-                    // Largest vertically scrollable element in the window.
-                    var root = AutomationElement.FromHandle(hwnd);
-                    var all = root.FindAll(TreeScope.Subtree, new PropertyCondition(AutomationElement.IsScrollPatternAvailableProperty, true));
-                    double bestArea = 0;
-                    foreach (AutomationElement e in all)
-                    {
-                        if (!IsVScrollable(e)) continue;
-                        var r = e.Current.BoundingRectangle;
-                        if (r.Width * r.Height > bestArea) { bestArea = r.Width * r.Height; el = e; }
-                    }
-                }
-                if (el == null) return null;
-
-                // Pane bounds can extend past the window; aim at the middle of the visible part.
-                var b = el.Current.BoundingRectangle;
-                GetWindowRect(hwnd, out var wr);
-                double l = Math.Max(b.Left, wr.Left), t = Math.Max(b.Top, wr.Top), r2 = Math.Min(b.Right, wr.Right), b2 = Math.Min(b.Bottom, wr.Bottom);
-                var pt = at is POINT ap && ap.X >= l && ap.X < r2 && ap.Y >= t && ap.Y < b2
-                    ? ap : new POINT { X = (int)((l + r2) / 2), Y = (int)((t + b2) / 2) };
-                return new Pane
-                {
-                    Sp = (ScrollPattern)el.GetCurrentPattern(ScrollPattern.Pattern),
-                    Name = $"{el.Current.ControlType.ProgrammaticName.Replace("ControlType.", "")} \"{el.Current.Name}\"",
-                    Point = pt,
-                };
-            }
-            catch (Exception ex) { Console.Error.WriteLine($"UI Automation unavailable: {ex.Message}"); return null; }
-        }
-
-        static bool IsVScrollable(AutomationElement e) =>
-            e.TryGetCurrentPattern(ScrollPattern.Pattern, out var o) && ((ScrollPattern)o).Current.VerticallyScrollable;
-    }
-
-    // Fallback only: UI Automation scroll calls make many apps (XAML) activate themselves.
-    sealed class UiaScroller(Pane pane) : IScroller
-    {
-        readonly ScrollPattern sp = pane.Sp;
-        readonly double startH = pane.Sp.Current.HorizontalScrollPercent, startV = pane.Sp.Current.VerticalScrollPercent;
-        public string Name => $"UI Automation calls on {pane.Name} (may bring the app to the front)";
-        public double InitialAmount { get { double v = sp.Current.VerticalViewSize; return v > 0 && v < 100 ? v * 0.5 : 5; } }
-        public double Clamp(double a) => Math.Clamp(a, 0.01, 50);
-        public bool ToTop() { sp.SetScrollPercent(ScrollPattern.NoScroll, 0); return false; }
-        public bool Down(double amount)
-        {
-            double cur = sp.Current.VerticalScrollPercent;
-            if (cur < 0 || cur >= 99.999) return false;
-            sp.SetScrollPercent(ScrollPattern.NoScroll, Math.Min(100, cur + amount));
-            return true;
-        }
-        public void Restore()
-        {
-            try { sp.SetScrollPercent(sp.Current.HorizontallyScrollable ? startH : ScrollPattern.NoScroll, startV); }
-            catch (Exception ex) { Console.Error.WriteLine($"Couldn't restore scroll position: {ex.Message}"); }
-        }
-    }
-
-    // Default: wheel messages posted straight to the pane's window. No input injection, no activation.
-    sealed class WheelScroller : IScroller
-    {
-        readonly IntPtr target;
-        readonly POINT pt;
-        readonly ScrollPattern? sp; // read-only, to know where we are
-        readonly double startV;
-        double pctPerNotch;
-        public string Name { get; }
-
-        public WheelScroller(IntPtr root, POINT pt, Pane? pane)
-        {
-            this.pt = pt;
-            sp = pane?.Sp;
-            target = DeepestChild(root, pt);
-            startV = Pct;
-            Name = $"posted wheel messages{(pane != null ? $" to {pane.Name}" : "")}";
-        }
-
-        double Pct { get { try { return sp?.Current.VerticalScrollPercent ?? -1; } catch { return -1; } } }
-
-        public double InitialAmount => 3;
-        public double Clamp(double a) => Math.Clamp(a, 1, 40);
-        public bool ToTop()
-        {
-            if (sp == null) { Post(-15); return true; } // no position info: caller watches the pixels
-            SeekTo(0, 20);
-            return false;
-        }
-        double lastPct = -1; int lastNotches;
-        public bool Down(double notches)
-        {
-            double now = Pct;
-            if (lastPct >= 0 && now > lastPct && lastNotches > 0) pctPerNotch = (now - lastPct) / lastNotches; // calibrates Restore
-            if (sp != null && now >= 99.999) return false;
-            lastPct = now; lastNotches = (int)Math.Round(notches);
-            Post(lastNotches);
-            return true;
-        }
-        public void Restore()
-        {
-            if (sp != null && startV >= 0) SeekTo(startV, 40);
-        }
-
-        // Posts wheel messages in bursts, watching the position via UI Automation reads, until it reaches target %.
-        void SeekTo(double target, int maxNotches)
-        {
-            var sw = Stopwatch.StartNew();
-            double last = Pct; long lastMove = 0;
-            while (sw.ElapsedMilliseconds < 15000 && sw.ElapsedMilliseconds - lastMove < 1000)
-            {
-                double diff = target - last;
-                if (Math.Abs(diff) < 0.2 || (target <= 0 && last <= 0.001) || (target >= 100 && last >= 99.999)) break;
-                int n = pctPerNotch > 0 ? (int)Math.Round(diff / pctPerNotch) : Math.Sign(diff) * maxNotches;
-                if (n == 0) n = Math.Sign(diff);
-                Post(Math.Clamp(n, -maxNotches, maxNotches));
-                // Wait for the position to settle (smooth scrolling animates).
-                double prev = double.NaN;
-                for (int i = 0; i < 20; i++)
-                {
-                    Thread.Sleep(30);
-                    double now = Pct;
-                    if (now == prev) break;
-                    prev = now;
-                }
-                if (Math.Abs(prev - last) > 0.0001) { last = prev; lastMove = sw.ElapsedMilliseconds; }
-            }
-        }
-
-        void Post(int notches) // positive = down
-        {
-            int delta = -120 * notches;
-            var wp = (IntPtr)((delta & 0xFFFF) << 16);
-            var lp = (IntPtr)(((pt.Y & 0xFFFF) << 16) | (pt.X & 0xFFFF));
-            PostMessage(target, 0x020A /*WM_MOUSEWHEEL*/, wp, lp);
-        }
-
-        // Deepest child of root at the point, even if other windows cover it. WinUI 3 receives input
-        // through a hidden, zero-size InputSiteWindowClass child, so prefer that when present.
-        static IntPtr DeepestChild(IntPtr root, POINT screen)
-        {
-            var h = root;
-            for (int i = 0; i < 32; i++)
-            {
-                var p = screen;
-                ScreenToClient(h, ref p);
-                var c = ChildWindowFromPointEx(h, p, 0x1 | 0x4 /*CWP_SKIPINVISIBLE | CWP_SKIPTRANSPARENT*/);
-                if (c == IntPtr.Zero || c == h) break;
-                h = c;
-            }
-            var site = FindWindowEx(h, IntPtr.Zero, "InputSiteWindowClass", null);
-            return site != IntPtr.Zero ? site : h;
-        }
-    }
-    // ---------- interop ----------
-    [StructLayout(LayoutKind.Sequential)] struct RECT { public int Left, Top, Right, Bottom; }
-    [StructLayout(LayoutKind.Sequential)] internal struct POINT { public int X, Y; }
-
-    [DllImport("user32.dll")] static extern bool SetProcessDpiAwarenessContext(IntPtr v);
-    [DllImport("user32.dll")] static extern bool GetCursorPos(out POINT p);
-    [DllImport("user32.dll")] static extern IntPtr WindowFromPoint(POINT p);
-    [DllImport("user32.dll")] static extern IntPtr GetAncestor(IntPtr h, uint flags);
-    [DllImport("user32.dll")] static extern bool GetWindowRect(IntPtr h, out RECT r);
-    [DllImport("user32.dll")] static extern bool PrintWindow(IntPtr h, IntPtr hdc, uint flags);
-    [DllImport("user32.dll")] static extern bool SetForegroundWindow(IntPtr h);
-    [DllImport("user32.dll")] static extern bool PostMessage(IntPtr h, uint msg, IntPtr wp, IntPtr lp);
-    delegate bool EnumProc(IntPtr h, IntPtr l);
-    [DllImport("user32.dll")] static extern bool EnumWindows(EnumProc cb, IntPtr l);
-    [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr h);
-    [DllImport("user32.dll")] static extern bool IsIconic(IntPtr h);
-    [DllImport("user32.dll")] static extern bool ScreenToClient(IntPtr h, ref POINT p);
-    [DllImport("user32.dll")] static extern IntPtr ChildWindowFromPointEx(IntPtr h, POINT p, uint flags);
-    [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern IntPtr FindWindowEx(IntPtr parent, IntPtr after, string? cls, string? title);
-    [DllImport("user32.dll")] static extern short GetAsyncKeyState(int vk);
-    [DllImport("user32.dll")] static extern bool ShowWindow(IntPtr h, int cmd);
-    [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetWindowText(IntPtr h, System.Text.StringBuilder sb, int max);
-    [DllImport("kernel32.dll")] static extern IntPtr GetConsoleWindow();
-    [DllImport("kernel32.dll")] static extern bool AttachConsole(int pid);
-    [DllImport("dwmapi.dll")] static extern int DwmGetWindowAttribute(IntPtr h, int attr, out RECT r, int size);
 }
