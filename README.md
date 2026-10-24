@@ -42,3 +42,7 @@ dotnet build -c Release
 ```
 
 Browsers are not a target yet (they throttle rendering when hidden).
+
+## License
+
+MIT - see [LICENSE](LICENSE).
