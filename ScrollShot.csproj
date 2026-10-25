@@ -18,6 +18,10 @@
     <Version>1.0.0</Version>
   </PropertyGroup>
   <ItemGroup>
+    <Compile Remove="tests\**" />
+    <None Remove="tests\**" />
+  </ItemGroup>
+  <ItemGroup>
     <PackageReference Include="Microsoft.Windows.CsWin32" Version="0.3.367">
       <PrivateAssets>all</PrivateAssets>
     </PackageReference>

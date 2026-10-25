@@ -38,7 +38,10 @@ scrollshot --help                     # all options
    `InputSiteWindowClass` child), one message per notch.
 3. Captures each step with `PrintWindow(PW_RENDERFULLCONTENT)`. The pane's scroll percentage predicts
    each step's pixel shift; a fuzzy row-signature match confirms it (and is the fallback when no position
-   is available). Steps that overshoot (apps accelerate bursts of wheel input) are backed up.
+   is available). On repeating content (list rows, table stripes) several shifts match; each candidate is
+   checked against real pixels and the smallest credible one wins, so rows aren't duplicated
+   (approach from [TinyClips](https://github.com/jamesmontemagno/tiny-clips)). Steps that overshoot
+   (apps accelerate bursts of wheel input) are backed up.
 4. Keeps fixed headers/footers once, fills non-scrolling columns (sidebars) with the background,
    restores the original scroll position, and saves a PNG via Windows Imaging Component.
 
@@ -52,6 +55,7 @@ Requires the .NET 10 SDK, the MSVC build tools for x64 and arm64 (for Native AOT
 
 ```
 dotnet build                              # quick dev build
+dotnet test tests/ScrollShot.Tests        # stitching tests (synthetic frames)
 ./build.ps1                               # Native AOT x64 + arm64, portable zips, unsigned .msixbundle in dist/
 ./build.ps1 -Cert devcert.pfx             # signed (winapp cert generate --manifest packaging/Package.appxmanifest)
 ```

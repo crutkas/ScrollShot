@@ -18,6 +18,9 @@ jobs:
         with:
           dotnet-version: "10.0.x"
 
+      - name: Test
+        run: dotnet test tests/ScrollShot.Tests -c Release
+
       - name: Install winapp CLI
         run: npm install -g @microsoft/winappcli
 
